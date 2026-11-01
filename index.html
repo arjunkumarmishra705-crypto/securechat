@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14110f">
+<title>SecureChat</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<style>
+:root{--bg:#14110f;--card:#1f1a17;--line:#332b26;--tx:#f2ebe4;--mut:#9b8f86;--ac:#e8b04a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font:16px/1.4 Georgia,'Times New Roman',serif;
+-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+input,button{font:inherit;color:inherit}
+input{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;width:100%;-webkit-user-select:text;user-select:text}
+button{background:var(--ac);color:#1a1208;border:0;border-radius:10px;padding:12px 16px;font-weight:700}
+button.g{background:var(--card);color:var(--tx);border:1px solid var(--line)}
+.view{display:none;height:100%;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.view.on{display:flex}
+.pad{padding:16px;display:flex;flex-direction:column;gap:12px}
+header{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+header b{flex:1;font-size:18px}
+.list{flex:1;overflow:auto;padding:8px 16px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:14px 4px;border-bottom:1px solid var(--line)}
+.badge{background:var(--ac);color:#1a1208;border-radius:99px;padding:1px 9px;font-size:13px;font-weight:700}
+.msg{max-width:80%;padding:10px 14px;border-radius:14px;margin:6px 0;border:1px solid var(--line)}
+.in{background:var(--card);align-self:flex-start;border-color:var(--ac)}
+.out{align-self:flex-end;color:var(--mut)}
+#msgs{display:flex;flex-direction:column}
+.bar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line)}
+.bar button{padding:12px}
+#err{color:#ff8a7a;min-height:20px;font-size:14px}
+#ov{position:fixed;inset:0;background:#000;z-index:9;display:none;flex-direction:column;align-items:center;justify-content:center;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+#ov.on{display:flex}
+#ov.blur #box{filter:blur(40px)}
+#box{max-width:100%;max-height:78%;display:flex;align-items:center;justify-content:center;overflow:auto}
+#box canvas,#box video{max-width:100%;max-height:74vh;pointer-events:auto}
+#box .t{font-size:22px;padding:20px;text-align:center;word-break:break-word}
+#wm{position:absolute;inset:0;pointer-events:none;overflow:hidden;display:flex;flex-wrap:wrap;align-content:space-around;justify-content:space-around;opacity:.14;transform:rotate(-25deg) scale(1.5);font-size:15px}
+#wm span{padding:22px}
+#ov button{margin-top:16px;position:relative;z-index:2}
+</style>
+</head>
+<body oncontextmenu="return false">
+
+<div id="vAuth" class="view on"><div class="pad" style="margin:auto 0">
+<h1 style="margin:0;font-size:30px">SecureChat</h1>
+<div style="color:var(--mut)">Messages are encrypted on your phone and vanish after one view.</div>
+<input id="u" placeholder="Username (a-z, 0-9, _)" autocapitalize="none" autocomplete="off">
+<input id="p" type="password" placeholder="Password (min 6)">
+<div id="err"></div>
+<button onclick="auth(false)">Log in</button>
+<button class="g" onclick="auth(true)">Create account</button>
+</div></div>
+
+<div id="vHome" class="view">
+<header><b id="me"></b><button class="g" onclick="logout()">Log out</button></header>
+<div class="pad" style="padding-bottom:0"><input id="q" placeholder="Search a username" oninput="renderHome()"></div>
+<div class="list" id="users"></div>
+</div>
+
+<div id="vChat" class="view">
+<header><button class="g" onclick="goHome()">Back</button><b id="peerName"></b></header>
+<div class="list" id="msgs"></div>
+<div class="bar">
+<button class="g" onclick="$('f').click()">+</button>
+<input id="t" placeholder="Message" autocomplete="off">
+<button class="g" id="rec" onclick="toggleRec()">Mic</button>
+<button onclick="sendText()">Send</button>
+</div>
+<input id="f" type="file" accept="image/*,video/*" hidden onchange="sendFile(this.files[0]);this.value=''">
+</div>
+
+<div id="ov"><div id="wm"></div><div id="box"></div><button onclick="closeOv()">Close</button></div>
+
+<script>
+const SB_URL='https://bxcemykfawjgrgrxnqze.supabase.co';
+const SB_KEY='sb_publishable_iIDCtzQRasmR7C5MuyyckQ_pdrH7BeS';
+const sb=supabase.createClient(SB_URL,SB_KEY);
+const $=id=>document.getElementById(id);
+const EC={name:'ECDH',namedCurve:'P-256'};
+let me=null,myName='',myPriv=null,peer=null,msgs=[],prof={},keys={},ovUrl=null,rec=null,chan=null;
+
+const toB64=buf=>{const a=new Uint8Array(buf);let s='';for(let i=0;i<a.length;i+=8192)s+=String.fromCharCode.apply(null,a.subarray(i,i+8192));return btoa(s)};
+const fromB64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const err=m=>$('err').textContent=m||'';
+
+function pack(mime,bytes){const m=new TextEncoder().encode(mime),o=new Uint8Array(2+m.length+bytes.length);o[0]=m.length>>8;o[1]=m.length&255;o.set(m,2);o.set(bytes,2+m.length);return o}
+function unpack(buf){const a=new Uint8Array(buf),l=(a[0]<<8)|a[1];return{mime:new TextDecoder().decode(a.subarray(2,2+l)),bytes:a.subarray(2+l)}}
+
+async function getProfile(id){if(!prof[id]){const{data}=await sb.from('profiles').select('id,username,public_key').eq('id',id).single();prof[id]=data}return prof[id]}
+async function sharedKey(p){
+  if(keys[p.id])return keys[p.id];
+  const pub=await crypto.subtle.importKey('jwk',JSON.parse(p.public_key),EC,false,[]);
+  return keys[p.id]=await crypto.subtle.deriveKey({name:'ECDH',public:pub},myPriv,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function enc(key,bytes){const iv=crypto.getRandomValues(new Uint8Array(12));return{iv:toB64(iv),ct:await crypto.subtle.encrypt({name:'AES-GCM',iv},key,bytes)}}
+const dec=(key,iv,ct)=>crypto.subtle.decrypt({name:'AES-GCM',iv:fromB64(iv)},key,ct);
+
+function show(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('on',v.id===id))}
+
+async function auth(signup){
+  err('');
+  const u=$('u').value.trim().toLowerCase(),pw=$('p').value;
+  if(!/^[a-z0-9_]{3,20}$/.test(u))return err('Username: 3-20 letters, numbers or _');
+  if(pw.length<6)return err('Password needs at least 6 characters');
+  const email=u+'@securechat.app';
+  if(signup){
+    const{data,error}=await sb.auth.signUp({email,password:pw});
+    if(error)return err(error.message);
+    if(!data.session)return err('Turn off "Confirm email" in Supabase Auth settings');
+    const k=await crypto.subtle.generateKey(EC,true,['deriveKey']);
+    const priv=await crypto.subtle.exportKey('jwk',k.privateKey);
+    const pub=await crypto.subtle.exportKey('jwk',k.publicKey);
+    const{error:e2}=await sb.from('profiles').insert({id:data.user.id,username:u,public_key:JSON.stringify(pub)});
+    if(e2){await sb.auth.signOut();return err(e2.message.includes('unique')?'Username already taken':e2.message)}
+    localStorage.setItem('pk_'+data.user.id,JSON.stringify(priv));
+  }else{
+    const{error}=await sb.auth.signInWithPassword({email,password:pw});
+    if(error)return err('Wrong username or password');
+  }
+  start();
+}
+
+async function start(){
+  const{data:{session}}=await sb.auth.getSession();
+  if(!session)return show('vAuth');
+  me=session.user;
+  const raw=localStorage.getItem('pk_'+me.id);
+  if(!raw){await sb.auth.signOut();show('vAuth');return err('Your key is not on this device. Create a new account here.')}
+  myPriv=await crypto.subtle.importKey('jwk',JSON.parse(raw),EC,false,['deriveKey']);
+  myName=(me.email||'').split('@')[0];
+  $('me').textContent='@'+myName;
+  const{data}=await sb.from('messages').select('*').order('created_at');
+  msgs=data||[];
+  if(chan)sb.removeChannel(chan);
+  chan=sb.channel('msgs').on('postgres_changes',{event:'*',schema:'public',table:'messages'},p=>{
+    if(p.eventType==='INSERT'&&!msgs.some(m=>m.id===p.new.id))msgs.push(p.new);
+    if(p.eventType==='DELETE')msgs=msgs.filter(m=>m.id!==p.old.id);
+    refresh();
+  }).subscribe();
+  goHome();
+}
+
+async function logout(){await sb.auth.signOut();msgs=[];keys={};me=null;show('vAuth')}
+function goHome(){peer=null;show('vHome');renderHome()}
+
+async function renderHome(){
+  let qq=sb.from('profiles').select('id,username,public_key').neq('id',me.id).order('username').limit(50);
+  const s=$('q').value.trim().toLowerCase();
+  if(s)qq=qq.ilike('username','%'+s+'%');
+  const{data}=await qq;
+  const box=$('users');box.textContent='';
+  (data||[]).forEach(p=>{
+    prof[p.id]=p;
+    const n=msgs.filter(m=>m.sender_id===p.id&&m.receiver_id===me.id).length;
+    const r=document.createElement('div');r.className='row';
+    const a=document.createElement('span');a.textContent='@'+p.username;r.append(a);
+    if(n){const b=document.createElement('span');b.className='badge';b.textContent=n;r.append(b)}
+    r.onclick=()=>openChat(p);box.append(r);
+  });
+  if(!(data||[]).length)box.textContent='No other users yet. Ask a friend to create an account.';
+}
+
+function openChat(p){peer=p;$('peerName').textContent='@'+p.username;show('vChat');renderMsgs()}
+function refresh(){if(peer&&$('vChat').classList.contains('on'))renderMsgs();else if($('vHome').classList.contains('on'))renderHome()}
+
+const LBL={text:'message',image:'photo',video:'video',audio:'voice note'};
+function renderMsgs(){
+  const box=$('msgs');box.textContent='';
+  msgs.filter(m=>(m.sender_id===peer.id&&m.receiver_id===me.id)||(m.sender_id===me.id&&m.receiver_id===peer.id)).forEach(m=>{
+    const d=document.createElement('div');
+    if(m.receiver_id===me.id){d.className='msg in';d.textContent='Tap to view '+LBL[m.kind]+' (once)';d.onclick=()=>openMsg(m)}
+    else{d.className='msg out';d.textContent='Sent '+LBL[m.kind]+', not opened yet'}
+    box.append(d);
+  });
+  box.scrollTop=box.scrollHeight;
+}
+
+async function postMsg(kind,key,bytes,mime){
+  const e=await enc(key,pack(mime,bytes));
+  let row={receiver_id:peer.id,kind,iv:e.iv};
+  if(kind==='text')row.ciphertext=toB64(e.ct);
+  else{
+    const path=me.id+'/'+crypto.randomUUID();
+    const{error}=await sb.storage.from('media').upload(path,new Blob([e.ct]),{contentType:'application/octet-stream'});
+    if(error)return alert('Upload failed: '+error.message);
+    row.media_path=path;
+  }
+  const{data,error}=await sb.from('messages').insert(row).select().single();
+  if(error)return alert(error.message);
+  if(!msgs.some(m=>m.id===data.id))msgs.push(data);
+  renderMsgs();
+}
+async function sendText(){
+  const v=$('t').value.trim();if(!v||!peer)return;$('t').value='';
+  await postMsg('text',await sharedKey(peer),new TextEncoder().encode(v),'text/plain');
+}
+async function sendFile(f){
+  if(!f||!peer)return;
+  if(f.size>25*1024*1024)return alert('File too big (max 25 MB)');
+  const kind=f.type.startsWith('video')?'video':'image';
+  await postMsg(kind,await sharedKey(peer),new Uint8Array(await f.arrayBuffer()),f.type||'application/octet-stream');
+}
+async function toggleRec(){
+  if(rec){rec.stop();return}
+  try{
+    const st=await navigator.mediaDevices.getUserMedia({audio:true});
+    const r=new MediaRecorder(st),ch=[];rec=r;$('rec').textContent='Stop';
+    r.ondataavailable=e=>ch.push(e.data);
+    r.onstop=async()=>{
+      st.getTracks().forEach(t=>t.stop());rec=null;$('rec').textContent='Mic';
+      const b=new Blob(ch,{type:r.mimeType||'audio/webm'});
+      await postMsg('audio',await sharedKey(peer),new Uint8Array(await b.arrayBuffer()),b.type);
+    };
+    r.start();
+  }catch(e){alert('Microphone not allowed')}
+}
+
+async function openMsg(m){
+  try{
+    const p=await getProfile(m.sender_id),key=await sharedKey(p);
+    let buf;
+    if(m.media_path){
+      const{data,error}=await sb.storage.from('media').download(m.media_path);
+      if(error)throw error;buf=await data.arrayBuffer();
+    }else buf=fromB64(m.ciphertext).buffer;
+    const{mime,bytes}=unpack(await dec(key,m.iv,buf));
+    // delete from server immediately, content now lives only in memory
+    await sb.from('messages').delete().eq('id',m.id);
+    if(m.media_path)await sb.storage.from('media').remove([m.media_path]);
+    msgs=msgs.filter(x=>x.id!==m.id);renderMsgs();
+    const box=$('box');box.textContent='';
+    if(m.kind==='text'){const d=document.createElement('div');d.className='t';d.textContent=new TextDecoder().decode(bytes);box.append(d)}
+    else if(m.kind==='image'){
+      const bmp=await createImageBitmap(new Blob([bytes],{type:mime}));
+      const c=document.createElement('canvas');c.width=bmp.width;c.height=bmp.height;c.getContext('2d').drawImage(bmp,0,0);box.append(c);
+    }else{
+      ovUrl=URL.createObjectURL(new Blob([bytes],{type:mime}));
+      const el=document.createElement(m.kind==='video'?'video':'audio');
+      el.src=ovUrl;el.controls=true;el.autoplay=true;el.playsInline=true;
+      el.setAttribute('controlsList','nodownload noplaybackrate');el.disablePictureInPicture=true;
+      box.append(el);
+    }
+    const wm=$('wm');wm.textContent='';
+    for(let i=0;i<60;i++){const s=document.createElement('span');s.textContent='@'+myName;wm.append(s)}
+    $('ov').classList.add('on');
+  }catch(e){alert('Could not open this message')}
+}
+function closeOv(){
+  $('ov').classList.remove('on');$('box').textContent='';
+  if(ovUrl){URL.revokeObjectURL(ovUrl);ovUrl=null}
+}
+const hide=b=>$('ov').classList.toggle('blur',b);
+document.addEventListener('visibilitychange',()=>hide(document.hidden));
+window.addEventListener('blur',()=>hide(true));
+window.addEventListener('focus',()=>hide(false));
+document.addEventListener('keydown',e=>{if(e.key==='PrintScreen'){closeOv()}});
+$('t').addEventListener('keydown',e=>{if(e.key==='Enter')sendText()});
+start();
+</script>
+</body>
+</html>
