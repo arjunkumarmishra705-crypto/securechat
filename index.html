@@ -25,7 +25,7 @@ header b{flex:1;font-size:18px}
 .badge{background:var(--ac);color:#1a1208;border-radius:99px;padding:1px 9px;font-size:13px;font-weight:700}
 .msg{max-width:80%;padding:10px 14px;border-radius:14px;margin:6px 0;border:1px solid var(--line)}
 .in{background:var(--card);align-self:flex-start;border-color:var(--ac)}
-.out{align-self:flex-end;color:var(--mut)}
+.out{align-self:flex-end;background:#2a2118}
 #msgs{display:flex;flex-direction:column}
 .bar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line)}
 .bar button{padding:12px}
@@ -79,7 +79,7 @@ const SB_KEY='sb_publishable_iIDCtzQRasmR7C5MuyyckQ_pdrH7BeS';
 const sb=supabase.createClient(SB_URL,SB_KEY);
 const $=id=>document.getElementById(id);
 const EC={name:'ECDH',namedCurve:'P-256'};
-let me=null,myName='',myPriv=null,peer=null,msgs=[],prof={},keys={},ovUrl=null,rec=null,chan=null;
+let me=null,myName='',myPriv=null,peer=null,msgs=[],prof={},keys={},ovUrl=null,rec=null,chan=null,copies=[],isKeeper=false;
 
 const toB64=buf=>{const a=new Uint8Array(buf);let s='';for(let i=0;i<a.length;i+=8192)s+=String.fromCharCode.apply(null,a.subarray(i,i+8192));return btoa(s)};
 const fromB64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
@@ -133,16 +133,19 @@ async function start(){
   $('me').textContent='@'+myName;
   const{data}=await sb.from('messages').select('*').order('created_at');
   msgs=data||[];
+  const{data:cp}=await sb.from('sent_copies').select('*').order('created_at');copies=cp||[];
+  const{data:kp}=await sb.from('keepers').select('user_id').maybeSingle();isKeeper=!!kp;await cleanup();
   if(chan)sb.removeChannel(chan);
-  chan=sb.channel('msgs').on('postgres_changes',{event:'*',schema:'public',table:'messages'},p=>{
+  chan=sb.channel('msgs').on('postgres_changes',{event:'*',schema:'public',table:'messages'},async p=>{
     if(p.eventType==='INSERT'&&!msgs.some(m=>m.id===p.new.id))msgs.push(p.new);
-    if(p.eventType==='DELETE')msgs=msgs.filter(m=>m.id!==p.old.id);
+    if(p.eventType==='DELETE'){msgs=msgs.filter(m=>m.id!==p.old.id);await cleanup()}
     refresh();
   }).subscribe();
   goHome();
 }
 
-async function logout(){await sb.auth.signOut();msgs=[];keys={};me=null;show('vAuth')}
+async function logout(){await sb.auth.signOut();msgs=[];copies=[];keys={};me=null;show('vAuth')}
+const keep=()=>isKeeper;
 function goHome(){peer=null;show('vHome');renderHome()}
 
 async function renderHome(){
@@ -166,29 +169,70 @@ function openChat(p){peer=p;$('peerName').textContent='@'+p.username;show('vChat
 function refresh(){if(peer&&$('vChat').classList.contains('on'))renderMsgs();else if($('vHome').classList.contains('on'))renderHome()}
 
 const LBL={text:'message',image:'photo',video:'video',audio:'voice note'};
+async function cleanup(){
+  if(isKeeper)return;
+  const old=copies.filter(c=>!c.incoming&&!msgs.some(m=>m.id===c.id));
+  if(!old.length)return;
+  const paths=old.map(c=>c.media_path).filter(Boolean);
+  if(paths.length)await sb.storage.from('media').remove(paths);
+  await sb.from('sent_copies').delete().in('id',old.map(c=>c.id));
+  copies=copies.filter(c=>!old.includes(c));
+}
+async function delMsg(c){
+  if(!confirm('Delete this message?'))return;
+  if(!c.incoming){
+    await sb.from('messages').delete().eq('id',c.id);msgs=msgs.filter(m=>m.id!==c.id);
+    if(c.media_path)await sb.storage.from('media').remove([c.media_path.replace(/_c$/,'_r')]);
+  }
+  if(c.media_path)await sb.storage.from('media').remove([c.media_path]);
+  await sb.from('sent_copies').delete().eq('id',c.id);
+  copies=copies.filter(x=>x.id!==c.id);renderMsgs();
+}
+async function readCopy(c){
+  const p=await getProfile(c.peer_id),key=await sharedKey(p);let buf;
+  if(c.media_path){const{data,error}=await sb.storage.from('media').download(c.media_path);if(error)throw error;buf=await data.arrayBuffer()}
+  else buf=fromB64(c.ciphertext).buffer;
+  return unpack(await dec(key,c.iv,buf));
+}
 function renderMsgs(){
   const box=$('msgs');box.textContent='';
-  msgs.filter(m=>(m.sender_id===peer.id&&m.receiver_id===me.id)||(m.sender_id===me.id&&m.receiver_id===peer.id)).forEach(m=>{
+  const items=[];
+  msgs.filter(m=>m.sender_id===peer.id&&m.receiver_id===me.id).forEach(m=>items.push({t:m.created_at,m}));
+  copies.filter(c=>c.peer_id===peer.id).forEach(c=>items.push({t:c.created_at,c}));
+  items.sort((a,b)=>a.t<b.t?-1:1);
+  items.forEach(x=>{
     const d=document.createElement('div');
-    if(m.receiver_id===me.id){d.className='msg in';d.textContent='Tap to view '+LBL[m.kind]+' (once)';d.onclick=()=>openMsg(m)}
-    else{d.className='msg out';d.textContent='Sent '+LBL[m.kind]+', not opened yet'}
+    if(x.m){d.className='msg in';d.textContent='Tap to view '+LBL[x.m.kind]+' (once)';d.onclick=()=>openMsg(x.m)}
+    else{
+      const c=x.c;d.className=c.incoming?'msg in':'msg out';
+      const main=document.createElement('div'),st=document.createElement('div');
+      st.style.cssText='font-size:12px;color:var(--mut);margin-top:4px';
+      st.textContent=c.incoming?'Saved in your account':(msgs.some(m=>m.id===c.id)?'Not opened yet':'Opened');
+      d.append(main,st);
+      const db=document.createElement('button');db.className='g';db.style.cssText='padding:4px 10px;font-size:12px;margin-top:6px';db.textContent='Delete';db.onclick=ev=>{ev.stopPropagation();delMsg(c)};d.append(db);
+      if(c.kind==='text'){main.textContent='...';readCopy(c).then(r=>main.textContent=new TextDecoder().decode(r.bytes)).catch(()=>main.textContent='(cannot read)')}
+      else{main.textContent='Your '+LBL[c.kind]+' (tap to view)';d.onclick=()=>openCopy(c)}
+    }
     box.append(d);
   });
   box.scrollTop=box.scrollHeight;
 }
 
 async function postMsg(kind,key,bytes,mime){
-  const e=await enc(key,pack(mime,bytes));
-  let row={receiver_id:peer.id,kind,iv:e.iv};
-  if(kind==='text')row.ciphertext=toB64(e.ct);
+  const e=await enc(key,pack(mime,bytes)),id=crypto.randomUUID();
+  const r={id,receiver_id:peer.id,kind,iv:e.iv},cp={id,peer_id:peer.id,kind,iv:e.iv};
+  if(kind==='text'){r.ciphertext=cp.ciphertext=toB64(e.ct)}
   else{
-    const path=me.id+'/'+crypto.randomUUID();
-    const{error}=await sb.storage.from('media').upload(path,new Blob([e.ct]),{contentType:'application/octet-stream'});
-    if(error)return alert('Upload failed: '+error.message);
-    row.media_path=path;
+    const base=me.id+'/'+id,blob=new Blob([e.ct]);
+    for(const sfx of ['r','c']){
+      const{error}=await sb.storage.from('media').upload(base+'_'+sfx,blob,{contentType:'application/octet-stream'});
+      if(error)return alert('Upload failed: '+error.message);
+    }
+    r.media_path=base+'_r';cp.media_path=base+'_c';
   }
-  const{data,error}=await sb.from('messages').insert(row).select().single();
-  if(error)return alert(error.message);
+  const{error:e1}=await sb.from('sent_copies').insert(cp);if(e1)return alert(e1.message);
+  const{data,error}=await sb.from('messages').insert(r).select().single();if(error)return alert(error.message);
+  copies.push({...cp,sender_id:me.id,created_at:data.created_at});
   if(!msgs.some(m=>m.id===data.id))msgs.push(data);
   renderMsgs();
 }
@@ -226,26 +270,43 @@ async function openMsg(m){
       if(error)throw error;buf=await data.arrayBuffer();
     }else buf=fromB64(m.ciphertext).buffer;
     const{mime,bytes}=unpack(await dec(key,m.iv,buf));
-    // delete from server immediately, content now lives only in memory
+    if(keep()){
+      const nid=crypto.randomUUID(),cp={id:nid,peer_id:m.sender_id,kind:m.kind,iv:m.iv,incoming:true,created_at:m.created_at};
+      if(m.media_path){
+        cp.media_path=me.id+'/'+nid+'_k';
+        const{error:ue}=await sb.storage.from('media').upload(cp.media_path,new Blob([buf]),{contentType:'application/octet-stream'});
+        if(ue){alert('Could not save a copy, message kept on server');return}
+      }else cp.ciphertext=m.ciphertext;
+      const{error:ie}=await sb.from('sent_copies').insert(cp);
+      if(ie){alert('Could not save a copy: '+ie.message);return}
+      copies.push({...cp,sender_id:me.id});
+    }
     await sb.from('messages').delete().eq('id',m.id);
     if(m.media_path)await sb.storage.from('media').remove([m.media_path]);
     msgs=msgs.filter(x=>x.id!==m.id);renderMsgs();
-    const box=$('box');box.textContent='';
-    if(m.kind==='text'){const d=document.createElement('div');d.className='t';d.textContent=new TextDecoder().decode(bytes);box.append(d)}
-    else if(m.kind==='image'){
-      const bmp=await createImageBitmap(new Blob([bytes],{type:mime}));
-      const c=document.createElement('canvas');c.width=bmp.width;c.height=bmp.height;c.getContext('2d').drawImage(bmp,0,0);box.append(c);
-    }else{
-      ovUrl=URL.createObjectURL(new Blob([bytes],{type:mime}));
-      const el=document.createElement(m.kind==='video'?'video':'audio');
-      el.src=ovUrl;el.controls=true;el.autoplay=true;el.playsInline=true;
-      el.setAttribute('controlsList','nodownload noplaybackrate');el.disablePictureInPicture=true;
-      box.append(el);
-    }
-    const wm=$('wm');wm.textContent='';
-    for(let i=0;i<60;i++){const s=document.createElement('span');s.textContent='@'+myName;wm.append(s)}
-    $('ov').classList.add('on');
+    await display(m.kind,mime,bytes);
   }catch(e){alert('Could not open this message')}
+}
+async function openCopy(c){
+  try{const{mime,bytes}=await readCopy(c);await display(c.kind,mime,bytes)}
+  catch(e){alert('Could not open')}
+}
+async function display(kind,mime,bytes){
+  const box=$('box');box.textContent='';
+  if(kind==='text'){const d=document.createElement('div');d.className='t';d.textContent=new TextDecoder().decode(bytes);box.append(d)}
+  else if(kind==='image'){
+    const bmp=await createImageBitmap(new Blob([bytes],{type:mime}));
+    const c=document.createElement('canvas');c.width=bmp.width;c.height=bmp.height;c.getContext('2d').drawImage(bmp,0,0);box.append(c);
+  }else{
+    ovUrl=URL.createObjectURL(new Blob([bytes],{type:mime}));
+    const el=document.createElement(kind==='video'?'video':'audio');
+    el.src=ovUrl;el.controls=true;el.autoplay=true;el.playsInline=true;
+    el.setAttribute('controlsList','nodownload noplaybackrate');el.disablePictureInPicture=true;
+    box.append(el);
+  }
+  const wm=$('wm');wm.textContent='';
+  for(let i=0;i<60;i++){const sp=document.createElement('span');sp.textContent='@'+myName;wm.append(sp)}
+  $('ov').classList.add('on');
 }
 function closeOv(){
   $('ov').classList.remove('on');$('box').textContent='';
