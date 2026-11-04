@@ -99,6 +99,33 @@ const dec=(key,iv,ct)=>crypto.subtle.decrypt({name:'AES-GCM',iv:fromB64(iv)},key
 
 function show(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('on',v.id===id))}
 
+async function wrapKey(pw,salt){
+  const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:600000,hash:'SHA-256'},km,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function makeBackup(pw,privJwk){
+  const salt=crypto.getRandomValues(new Uint8Array(16)),iv=crypto.getRandomValues(new Uint8Array(12));
+  const k=await wrapKey(pw,salt);
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},k,new TextEncoder().encode(JSON.stringify(privJwk)));
+  return JSON.stringify({s:toB64(salt),i:toB64(iv),c:toB64(ct)});
+}
+async function openBackup(pw,str){
+  const o=JSON.parse(str),k=await wrapKey(pw,fromB64(o.s));
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:fromB64(o.i)},k,fromB64(o.c));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+async function syncKey(uid,pw){
+  const{data:kb}=await sb.from('key_backups').select('backup').eq('user_id',uid).maybeSingle();
+  const raw=localStorage.getItem('pk_'+uid);
+  if(!raw){
+    if(!kb)return 'Your key is not on this device and there is no backup. Create a new account.';
+    try{localStorage.setItem('pk_'+uid,JSON.stringify(await openBackup(pw,kb.backup)))}
+    catch(e){return 'Could not unlock your key backup'}
+  }else if(!kb){
+    await sb.from('key_backups').insert({user_id:uid,backup:await makeBackup(pw,JSON.parse(raw))});
+  }
+  return '';
+}
 async function auth(signup){
   err('');
   const u=$('u').value.trim().toLowerCase(),pw=$('p').value;
@@ -113,11 +140,14 @@ async function auth(signup){
     const priv=await crypto.subtle.exportKey('jwk',k.privateKey);
     const pub=await crypto.subtle.exportKey('jwk',k.publicKey);
     const{error:e2}=await sb.from('profiles').insert({id:data.user.id,username:u,public_key:JSON.stringify(pub)});
+    if(!e2){const{error:e3}=await sb.from('key_backups').insert({user_id:data.user.id,backup:await makeBackup(pw,priv)});if(e3)alert('Key backup failed: '+e3.message)}
     if(e2){await sb.auth.signOut();return err(e2.message.includes('unique')?'Username already taken':e2.message)}
     localStorage.setItem('pk_'+data.user.id,JSON.stringify(priv));
   }else{
-    const{error}=await sb.auth.signInWithPassword({email,password:pw});
+    const{data:sd,error}=await sb.auth.signInWithPassword({email,password:pw});
     if(error)return err('Wrong username or password');
+    const msg=await syncKey(sd.user.id,pw);
+    if(msg){await sb.auth.signOut();return err(msg)}
   }
   start();
 }
